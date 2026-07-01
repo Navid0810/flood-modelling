@@ -1,0 +1,380 @@
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+from shapely.geometry import Point, box
+from pathlib import Path
+
+import rasterio
+from rasterio.transform import xy
+from rasterio.mask import mask as rio_mask
+
+# PATHS
+
+DATA_FOLDER = Path(r"C:\Users\Navid Chowdhury\OneDrive\Desktop\FloodProject")
+TARGET_CRS  = "EPSG:27700"   # British National Grid – metres, good for UK distance ops
+GDB_PATH    = DATA_FOLDER / "SEPA_River_Flood_Maps_v3_0" / "Data" / "FRM_River_Flood_Hazard_Layers_v3_0.gdb"
+
+N_HOMES = 1000
+
+# SCENARIO DEFINITIONS
+# based on SEPA flood-likelihood scenarios: H / M / L.
+
+SCENARIOS = {
+    #  name  : (annual_prob, layers)
+    "H": (0.10,  ("FRM_FH_RIVER_EXTENT_H", "FRM_FH_RIVER_DEPTH_H", "FRM_FH_RIVER_VELOCITY_H")),
+    "M": (0.005, ("FRM_FH_RIVER_EXTENT_M", "FRM_FH_RIVER_DEPTH_M", "FRM_FH_RIVER_VELOCITY_M")),
+    "L": (0.001, ("FRM_FH_RIVER_EXTENT_L", "FRM_FH_RIVER_DEPTH_L", "FRM_FH_RIVER_VELOCITY_L")),
+}
+
+# LOAD BOUNDARIES FOR SCOTLAND
+
+uk       = gpd.read_file(DATA_FOLDER / "Countries_December_2021_UK_BGC_2022_3086045511409320600.gpkg",
+                          engine="pyogrio").to_crs(TARGET_CRS)
+scotland = uk[uk["CTRY21NM"] == "Scotland"]
+
+
+scotland_geom = scotland.union_all().simplify(10)
+minx, miny, maxx, maxy = scotland.total_bounds
+
+
+rivers = gpd.read_file(DATA_FOLDER / "os_open_rivers_watercourse_5944441748497586853.gpkg",
+                        bbox=(minx, miny, maxx, maxy), engine="pyogrio").to_crs(TARGET_CRS)
+rivers_scotland = rivers[rivers.intersects(scotland_geom)]
+
+# GENERATE HOMES FROM POPULATION DENSITY RASTER
+
+
+with rasterio.open(DATA_FOLDER / "7beefde9-c520-4ddf-897a-0167e8918595" / "data" / "uk_residential_population_2021.tif") as src:
+    population, transform = rio_mask(src, [scotland_geom], crop=True, nodata=0)
+    population = population[0].astype(float)
+
+valid_rows, valid_cols = np.where(population > 0)
+xs, ys = xy(transform, valid_rows, valid_cols)
+
+scot_weights = population[valid_rows, valid_cols]
+scot_weights /= scot_weights.sum()
+
+np.random.seed(42)
+chosen = np.random.choice(len(valid_rows), size=N_HOMES, p=scot_weights)
+
+homes = [
+    Point(xs[i] + np.random.uniform(-500, 500),
+          ys[i] + np.random.uniform(-500, 500))
+    for i in chosen
+]
+
+homes_gdf = gpd.GeoDataFrame(geometry=homes, crs=TARGET_CRS)
+
+# PROPERTY VALUES
+# Lognormal distribution for modelling house prices for long right-tail of Scottish property values
+# Parameters chosen to give approximately:
+# Median house value ≈ £250,000
+# Mean house value   ≈ £290,000
+
+
+PROPERTY_LOG_MEAN = np.log(250000)
+PROPERTY_LOG_STD  = 0.45
+
+homes_gdf["property_value"] = np.random.lognormal(
+    mean=PROPERTY_LOG_MEAN,
+    sigma=PROPERTY_LOG_STD,
+    size=N_HOMES
+)
+
+# BOUNDING BOX AROUND HOMES
+# Prevents loading every SEPA flood polygon for the whole of Scotland, which is slow and unnecessary.
+
+
+BBOX_BUFFER_M = 5000  # 5 km padding around the home cluster
+
+hx_min, hy_min, hx_max, hy_max = homes_gdf.total_bounds
+homes_bbox = (hx_min - BBOX_BUFFER_M, hy_min - BBOX_BUFFER_M,
+              hx_max + BBOX_BUFFER_M, hy_max + BBOX_BUFFER_M)
+
+# LOAD FLOOD LAYERS (bbox-filtered)
+
+import os
+os.environ["OGR_ORGANIZE_POLYGONS"] = "SKIP"
+
+import time
+
+LAYER_COLUMNS = {"extent": [], "depth": ["Depth"], "velocity": ["Velocity"]}
+
+flood_layers = {}   # flood_layers["H"] = {"extent": gdf, "depth": gdf, "velocity": None, ...}
+
+for scenario, (prob, (ext_name, dep_name, vel_name)) in SCENARIOS.items():
+    flood_layers[scenario] = {}
+    for label, name in [("extent", ext_name), ("depth", dep_name), ("velocity", vel_name)]:
+        t0 = time.time()
+        try:
+            gdf = gpd.read_file(
+                GDB_PATH, layer=name, bbox=homes_bbox,
+                columns=LAYER_COLUMNS[label], engine="pyogrio",
+            ).to_crs(TARGET_CRS)
+            flood_layers[scenario][label] = gdf
+            print(f"Loaded {name}: {len(gdf)} features in {time.time() - t0:.1f}s")
+        except Exception as e:
+            print(f"Could not load {name}: {e} (after {time.time() - t0:.1f}s)")
+            flood_layers[scenario][label] = None
+
+# DEPTH-DAMAGE CURVE
+# Depth (m)  →  Damage ratio (% of property value)
+#   0.0      →  0%    (no water ingress)
+#   0.1      →  10%   (shallow flooding still damages flooring/electrics)
+#   0.3      →  20%
+#   0.6      →  32%
+#   1.0      →  45%
+#   1.5      →  55%
+#   2.0      →  62%
+#   3.0+     →  70%   (cap — treated as maximum realistic residential loss,
+#                       not 100%, since land retains some value)
+
+DEPTH_DAMAGE_DEPTHS  = np.array([0.0, 0.1, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0])
+DEPTH_DAMAGE_RATIOS  = np.array([0.00, 0.10, 0.20, 0.32, 0.45, 0.55, 0.62, 0.70])
+
+def depth_to_damage_ratio(depth_m):
+    """Vectorised lookup: flood depth (m) -> base damage ratio (0-1)."""
+    depth_m = np.clip(depth_m, 0, DEPTH_DAMAGE_DEPTHS.max())
+    return np.interp(depth_m, DEPTH_DAMAGE_DEPTHS, DEPTH_DAMAGE_RATIOS)
+
+# - Velocity modifier -
+# Amplifies depth damage rather than being a standalone damage factor.
+#   Velocity < 1 m/s   → no uplift (calm/slow water)
+#   Velocity 1-2 m/s   → up to +15% uplift
+#   Velocity > 2 m/s   → capped at +25% uplift (structural damage threshold)
+VELOCITY_LOW, VELOCITY_HIGH = 1.0, 2.0
+UPLIFT_MAX = 0.25
+
+def velocity_modifier(velocity_ms):
+    """Vectorised lookup: flow velocity (m/s) -> multiplicative uplift factor (1.0-1.25)."""
+    uplift = np.interp(velocity_ms, [0, VELOCITY_LOW, VELOCITY_HIGH], [0, 0, UPLIFT_MAX])
+    uplift = np.clip(uplift, 0, UPLIFT_MAX)
+    return 1.0 + uplift
+
+# LOSS CALCULATION  
+
+DEPTH_CAP = 3.0  # metres, matches the top anchor of the damage curve
+
+homes_gdf["ead_score"] = 0.0        # kept: dimensionless risk score (0-1 scale), useful for mapping
+homes_gdf["eal"]       = 0.0        # NEW: monetary Expected Annual Loss (£)
+
+for scenario, (annual_prob, _) in SCENARIOS.items():
+    layers = flood_layers[scenario]
+
+    # - Extent  -
+    if layers["extent"] is not None and not layers["extent"].empty:
+        joined = gpd.sjoin(homes_gdf[["geometry"]], layers["extent"][["geometry"]],
+                           how="left", predicate="intersects")
+        in_extent = joined["index_right"].notna()
+        in_extent = in_extent.groupby(in_extent.index).any()
+    else:
+        in_extent = pd.Series(False, index=homes_gdf.index)
+
+    homes_gdf[f"flooded_{scenario}"] = in_extent
+
+    # - Depth (metres of water at this home, worst-case if multiple polygons) -
+    depth_vals = pd.Series(np.nan, index=homes_gdf.index)
+    if layers["depth"] is not None and not layers["depth"].empty and "Depth" in layers["depth"].columns:
+        d_join = gpd.sjoin(homes_gdf[["geometry"]], layers["depth"][["geometry", "Depth"]],
+                           how="left", predicate="intersects")
+        depth_vals = d_join["Depth"].groupby(d_join.index).max()
+        depth_vals = depth_vals.reindex(homes_gdf.index)
+
+    # - Velocity (m/s, worst-case if multiple polygons) -
+    vel_vals = pd.Series(np.nan, index=homes_gdf.index)
+    if layers["velocity"] is not None and not layers["velocity"].empty and "Velocity" in layers["velocity"].columns:
+        v_join = gpd.sjoin(homes_gdf[["geometry"]], layers["velocity"][["geometry", "Velocity"]],
+                           how="left", predicate="intersects")
+        vel_vals = v_join["Velocity"].groupby(v_join.index).max()
+        vel_vals = vel_vals.reindex(homes_gdf.index)
+
+    # Use a conservative fallback where extent exists but depth is unavailable.
+    FALLBACK_DEPTH_M = 0.3
+    depth_for_damage = depth_vals.where(depth_vals.notna(), in_extent.astype(float) * FALLBACK_DEPTH_M)
+    depth_for_damage = depth_for_damage.where(in_extent, 0.0)  # zero if not flooded at all
+
+    velocity_for_damage = vel_vals.fillna(0.0).where(in_extent, 0.0)
+
+    # - Damage ratio via depth-damage curve, uplifted by velocity -
+    base_ratio = depth_to_damage_ratio(depth_for_damage.values)
+    uplift     = velocity_modifier(velocity_for_damage.values)
+    damage_ratio = np.clip(base_ratio * uplift, 0, 1)  # cap at 100% of property value
+
+    damage_ratio = pd.Series(damage_ratio, index=homes_gdf.index)
+    homes_gdf[f"damage_ratio_{scenario}"] = damage_ratio
+
+    # - Monetary loss for this scenario, if it occurs -
+    loss = homes_gdf["property_value"] * damage_ratio
+    homes_gdf[f"loss_{scenario}"] = loss
+
+    # - Accumulate into EAL (£) and the dimensionless ead_score (0-1) -
+    homes_gdf["eal"]       += annual_prob * loss
+    homes_gdf["ead_score"] += annual_prob * damage_ratio
+
+# RISK BANDS
+
+
+def risk_band(eal):
+    if eal == 0:        return "None"
+    elif eal < 50:       return "Low"
+    elif eal < 250:      return "Medium"
+    elif eal < 1000:     return "High"
+    else:                return "Very High"
+
+homes_gdf["risk_band"] = homes_gdf["eal"].apply(risk_band)
+
+band_order  = ["None", "Low", "Medium", "High", "Very High"]
+band_colors = {"None": "#cccccc", "Low": "#2196F3", "Medium": "#FF9800", "High": "#F44336", "Very High": "#7B1FA2"}
+
+# METRICS
+
+print("\n=== Results ===")
+for s in SCENARIOS:
+    n = homes_gdf[f"flooded_{s}"].sum()
+    mean_loss = homes_gdf.loc[homes_gdf[f"flooded_{s}"], f"loss_{s}"].mean()
+    print(f"Scenario {s}: {n} homes in extent ({n/N_HOMES:.1%}), "
+          f"mean loss when flooded: £{0 if np.isnan(mean_loss) else mean_loss:,.0f}")
+
+print(f"\nRisk band breakdown (by EAL):")
+print(homes_gdf["risk_band"].value_counts().reindex(band_order))
+
+print(f"\nMean EAL per property:  £{homes_gdf['eal'].mean():,.2f}")
+print(f"Max  EAL (single home): £{homes_gdf['eal'].max():,.2f}")
+print(f"Total portfolio EAL:    £{homes_gdf['eal'].sum():,.2f}")
+print(f"Total insured value:    £{homes_gdf['property_value'].sum():,.2f}")
+print(f"Portfolio EAL as % of insured value: {100 * homes_gdf['eal'].sum() / homes_gdf['property_value'].sum():.3f}%")
+
+# Monte Carlo simulation
+# Simulate annual portfolio losses using independent Bernoulli trials
+# for each flood scenario.
+
+N_YEARS = 10_000
+np.random.seed(123)  # separate seed from home generation, kept fixed for reproducibility
+
+# Pre-extract as plain numpy arrays 
+loss_H = homes_gdf["loss_H"].values
+loss_M = homes_gdf["loss_M"].values
+loss_L = homes_gdf["loss_L"].values
+n_props = len(homes_gdf)
+
+prob_H = SCENARIOS["H"][0]
+prob_M = SCENARIOS["M"][0]
+prob_L = SCENARIOS["L"][0]
+
+annual_portfolio_losses = np.zeros(N_YEARS)
+
+for year in range(N_YEARS):
+    # One Bernoulli draw per property per scenario this year.
+    occurs_H = np.random.random(n_props) < prob_H
+    occurs_M = np.random.random(n_props) < prob_M
+    occurs_L = np.random.random(n_props) < prob_L
+
+    # Per-property loss this year: take the worst scenario that actually
+    # occurred, as a property can't lose more than its own worst flood in one year
+    year_loss_per_home = np.maximum.reduce([
+        np.where(occurs_H, loss_H, 0.0),
+        np.where(occurs_M, loss_M, 0.0),
+        np.where(occurs_L, loss_L, 0.0),
+    ])
+
+    annual_portfolio_losses[year] = year_loss_per_home.sum()
+
+# SIMULATION METRICS
+
+AAL_simulated = annual_portfolio_losses.mean()
+AAL_analytical = homes_gdf["eal"].sum()  # sanity-check comparison
+
+VaR_95 = np.percentile(annual_portfolio_losses, 95)
+VaR_99 = np.percentile(annual_portfolio_losses, 99)
+max_loss = annual_portfolio_losses.max()
+
+EXCEEDANCE_THRESHOLD = 10_000_000  # £10 million
+prob_exceeds_10m = (annual_portfolio_losses > EXCEEDANCE_THRESHOLD).mean()
+
+print("\n=== Monte Carlo Simulation (10,000 simulated years) ===")
+print(f"Average Annual Loss (simulated):   £{AAL_simulated:,.0f}")
+print(f"Average Annual Loss (analytical):  £{AAL_analytical:,.0f}   <- sanity check, should be close")
+print(f"95th percentile annual loss (VaR95): £{VaR_95:,.0f}")
+print(f"99th percentile annual loss (VaR99): £{VaR_99:,.0f}")
+print(f"Maximum observed annual loss:       £{max_loss:,.0f}")
+print(f"P(annual loss > £10,000,000):       {prob_exceeds_10m:.4%}")
+
+# EXCEEDANCE PROBABILITY CURVE
+
+thresholds = np.linspace(0, np.percentile(annual_portfolio_losses, 99.9), 200)
+exceedance_probs = [(annual_portfolio_losses > t).mean() for t in thresholds]
+
+fig_ep, ax_ep = plt.subplots(figsize=(8, 5))
+ax_ep.plot(thresholds / 1e6, exceedance_probs, color="darkred", linewidth=1.5)
+ax_ep.axvline(VaR_95 / 1e6, color="orange", linestyle="--", linewidth=1, label=f"VaR95 = £{VaR_95/1e6:.2f}m")
+ax_ep.axvline(VaR_99 / 1e6, color="purple", linestyle="--", linewidth=1, label=f"VaR99 = £{VaR_99/1e6:.2f}m")
+ax_ep.set_xlabel("Annual portfolio loss (£ millions)")
+ax_ep.set_ylabel("Probability of exceedance")
+ax_ep.set_title("Exceedance Probability (EP) Curve — 10,000 Simulated Years")
+ax_ep.legend()
+plt.tight_layout()
+plt.show()
+
+# HISTOGRAM OF SIMULATED ANNUAL LOSSES
+
+fig_hist, ax_hist = plt.subplots(figsize=(8, 5))
+ax_hist.hist(annual_portfolio_losses / 1e6, bins=80, color="steelblue", edgecolor="white")
+ax_hist.axvline(AAL_simulated / 1e6, color="black", linestyle="-", linewidth=1.5, label=f"Mean (AAL) = £{AAL_simulated/1e6:.2f}m")
+ax_hist.axvline(VaR_95 / 1e6, color="orange", linestyle="--", linewidth=1.5, label=f"VaR95 = £{VaR_95/1e6:.2f}m")
+ax_hist.axvline(VaR_99 / 1e6, color="purple", linestyle="--", linewidth=1.5, label=f"VaR99 = £{VaR_99/1e6:.2f}m")
+ax_hist.set_xlabel("Simulated annual portfolio loss (£ millions)")
+ax_hist.set_ylabel("Number of simulated years")
+ax_hist.set_title("Distribution of Simulated Annual Portfolio Losses (N = 10,000 years)")
+ax_hist.legend()
+plt.tight_layout()
+plt.show()
+
+# PLOT
+# Left panel: risk bands based on EAL (£)
+# Right panel: raw EAL on a log scale (showing continuous £ variation)
+# log scale: because EAL values span several orders of magnitude,
+# plotting them linearly would make most homes look negligible
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 9))
+
+for ax in (ax1, ax2):
+    scotland.boundary.plot(ax=ax, color="black", linewidth=0.5)
+    rivers_scotland.plot(ax=ax, color="steelblue", linewidth=0.3, alpha=0.5)
+    ax.set_xlim(minx, maxx); ax.set_ylim(miny, maxy)
+
+# Left: categorical risk bands
+for band in band_order:
+    sub = homes_gdf[homes_gdf["risk_band"] == band]
+    if not sub.empty:
+        sub.plot(ax=ax1, color=band_colors[band], markersize=4, alpha=0.8, label=band)
+
+ax1.set_title("Flood Risk Band (by Expected Annual Loss)")
+ax1.legend(handles=[mpatches.Patch(color=band_colors[b], label=b) for b in band_order],
+           loc="upper left", fontsize=8)
+
+# Right: continuous EAL (log scale colour map)
+non_zero = homes_gdf[homes_gdf["eal"] > 0]
+homes_gdf[homes_gdf["eal"] == 0].plot(ax=ax2, color="#cccccc", markersize=2, alpha=0.4)
+if not non_zero.empty:
+    sc = ax2.scatter(non_zero.geometry.x, non_zero.geometry.y,
+                     c=np.log1p(non_zero["eal"]), cmap="plasma", s=8, alpha=0.9)
+    plt.colorbar(sc, ax=ax2, label="log(1 + EAL, £)")
+
+ax2.set_title("Expected Annual Loss (£, log scale)")
+
+plt.suptitle("Scotland River Flood Risk & Expected Annual Loss  |  SEPA FRM v3.0 + 2021 Census Population", y=1.02)
+plt.tight_layout()
+plt.show()
+
+# EXPORT
+
+output_cols = ["property_value", "ead_score", "eal", "risk_band"] + \
+              [f"flooded_{s}" for s in SCENARIOS] + \
+              [f"damage_ratio_{s}" for s in SCENARIOS] + \
+              [f"loss_{s}" for s in SCENARIOS]
+
+homes_gdf[output_cols].to_csv(DATA_FOLDER / "flood_eal_portfolio.csv", index=False)
+print(f"\nPortfolio table written to {DATA_FOLDER / 'flood_eal_portfolio.csv'}")
